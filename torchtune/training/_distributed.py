@@ -44,7 +44,7 @@ torch_version = torch.__version__
 # _DISTRIBUTED_STATE_DICT_API_IS_AVAILABLE = (
 #     "dev" not in torch_version and torch_version_ge("2.6.0")
 # ) or ("dev" in torch_version and torch_version.split("dev")[1] >= "20241220")
-_DISTRIBUTED_STATE_DICT_API_IS_AVAILABLE = False
+_DISTRIBUTED_STATE_DICT_API_IS_AVAILABLE = True
 
 
 def _get_sharding_strategy(strategy: str) -> ShardingStrategy:
