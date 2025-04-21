@@ -11,6 +11,12 @@ import torch
 import torch.nn as nn
 from torchao.dtypes.nf4tensor import linear_nf4, to_nf4
 
+import torchao
+def patched_getattr(self, name):
+    if name=="fsdp_pre_all_gather": torch.xpu.synchronize()
+    attr = object.__getattribute__(self, name)
+    return attr
+torchao.dtypes.nf4tensor.NF4Tensor.__getattribute__ = patched_getattr
 
 class FrozenNF4Linear(nn.Linear):
     """
