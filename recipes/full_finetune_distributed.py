@@ -7,6 +7,7 @@
 import os
 import sys
 import time
+from datetime import timedelta
 
 from functools import partial
 from typing import Any, Dict, List, Optional, Union
@@ -47,6 +48,12 @@ from torchtune.training.quantization import (
 
 from tqdm import tqdm
 
+import torch.distributed._functional_collectives as funcol
+import torch.distributed.distributed_c10d as c10d
+def _dist_reduce(x: torch.Tensor, mesh):
+    if isinstance(x, DTensor):
+        x = x.full_tensor()
+    return funcol.all_reduce(x, reduceOp=c10d.ReduceOp.AVG.name, group=mesh).item()
 
 class FullFinetuneRecipeDistributed(FTRecipeInterface):
     """
@@ -182,6 +189,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         self._log_every_n_steps = cfg.get("log_every_n_steps", 1)
         self._log_peak_memory_stats = cfg.get("log_peak_memory_stats", False)
         self._logger = utils.get_logger(cfg.log_level)
+        self._logger.info(str(self._device)+" PG inited. Recognized as "+str(self.world_size)+" / "+str(self.rank))
         if (
             self._log_peak_memory_stats
             and self._device.type not in VALID_BACKENDS_FOR_MEMORY_STATS
@@ -891,7 +899,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 # and increment the total number of tokens seen in the step
                 current_num_tokens = (
                     batch["labels"] != self._loss_fn.ignore_index
-                ).sum()
+                ).float().sum()
                 num_tokens += current_num_tokens
 
                 # Loss is normalized by default so we multiply by the number of tokens
@@ -910,14 +918,14 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 # Optimizer step (if not fused in backward call)
                 if (idx + 1) % self._gradient_accumulation_steps == 0:
                     if not self._optimizer_in_bwd:
-                        # Get total number of tokens across all ranks to normalize gradients
-                        torch.distributed.all_reduce(num_tokens)
-                        # This will ensure that the logged loss matches what we're optimizing
-                        torch.distributed.all_reduce(running_loss)
+                        num_tokens = num_tokens.detach()
+                        running_loss = running_loss.detach()
+                        num_tokens = _dist_reduce(num_tokens, self.world_mesh["dp"])
+                        running_loss = _dist_reduce(running_loss, self.world_mesh["dp"])
 
                         # Manually scale the gradients from unnormalized loss by total # of tokens
                         self._grad_scaler(
-                            self._model.parameters(), self.dp_degree / num_tokens
+                            self._model.parameters(), torch.tensor(self.dp_degree / num_tokens)
                         )
 
                         if self._clip_grad_norm is not None:
@@ -948,7 +956,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                     ):
                         precompute_float8_dynamic_scale_for_fsdp(self._model)
 
-                    loss_to_log = running_loss.detach().item() / num_tokens
+                    loss_to_log = running_loss / num_tokens
                     pbar.update(1)
                     pbar.set_description(
                         f"{curr_epoch + 1}|{self.global_step}|Loss: {loss_to_log}"
