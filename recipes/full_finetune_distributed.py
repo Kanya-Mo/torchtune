@@ -189,7 +189,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         self._log_every_n_steps = cfg.get("log_every_n_steps", 1)
         self._log_peak_memory_stats = cfg.get("log_peak_memory_stats", False)
         self._logger = utils.get_logger(cfg.log_level)
-        self._logger.info(str(self._device)+" PG inited. Recognized as "+str(self.world_size)+" / "+str(self.rank))
+        self._logger.info(str(self._device)+" PG inited from "+str(self.rank)+" / "+str(self.world_size))
         if (
             self._log_peak_memory_stats
             and self._device.type not in VALID_BACKENDS_FOR_MEMORY_STATS

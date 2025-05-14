@@ -6,6 +6,7 @@
 
 import sys
 import time
+from datetime import timedelta
 
 from functools import partial
 from typing import Any, Dict, List, Optional, Union
@@ -43,6 +44,12 @@ from torchtune.training import (
 )
 from tqdm import tqdm
 
+import torch.distributed._functional_collectives as funcol
+import torch.distributed.distributed_c10d as c10d
+def _dist_reduce(x: torch.Tensor, mesh):
+    if isinstance(x, DTensor):
+        x = x.full_tensor()
+    return funcol.all_reduce(x, reduceOp=c10d.ReduceOp.AVG.name, group=mesh).item()
 
 class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
     """
@@ -151,6 +158,31 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
         self.world_size, self.rank = utils.get_world_size_and_rank()
 
         self._is_rank_zero = self.rank == 0
+        self.tp_plan = cfg.get("tensor_parallel_plan", None)
+        self.tp_degree = cfg.get("tensor_parallel_dim", 1)
+        if self.tp_degree > 1 and self.tp_plan is None:
+            raise ValueError(
+                "Tensor Parallel plan needs to be provided when tensor parallel is enabled."
+            )
+        data_shard = cfg.get("data_parallel_shard_dim", -1)  # -1 means to infer
+        data_replicate = cfg.get("data_parallel_replicate_dim", 1)
+
+        # Set up n-d device mesh
+        self.parallel_dims = training.ParallelDims(
+            dp_replicate=data_replicate,
+            dp_shard=data_shard,
+            tp=self.tp_degree,
+            world_size=self.world_size,
+        )
+        self.world_mesh = self.parallel_dims.build_mesh(device_type=cfg.device)
+        if self.parallel_dims.dp_enabled:
+            dp_mesh = self.world_mesh["dp"]
+            self.dp_degree, self.dp_rank = (
+                dp_mesh.size(),
+                dp_mesh.get_local_rank(),
+            )
+        else:
+            self.dp_degree, self.dp_rank = 1, 0
 
         # logging attributes
         self._output_dir = cfg.output_dir
@@ -182,6 +214,7 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
         self._save_adapter_weights_only = cfg.get("save_adapter_weights_only", False)
         self._resume_from_checkpoint = cfg.resume_from_checkpoint
         self._gradient_accumulation_steps = cfg.gradient_accumulation_steps
+        self._logger.info(str(self._device)+" PG inited from "+str(self.rank)+" / "+str(self.world_size))
 
         self._run_val_every_n_steps = cfg.get("run_val_every_n_steps", None)
         if self._run_val_every_n_steps is not None:
@@ -470,7 +503,28 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
                 model, auto_wrap_policy={modules.TransformerSelfAttentionLayer}
             )
 
+        lora_device = "cpu" if fsdp_cpu_offload else self._device
+        for m in model.modules():
+            if (isinstance(m, AdapterModule)) and not lora_weights_state_dict:
+                # lora may not be covered in state dict
+                # if finetune for the 1st time
+                m.to_empty(device=lora_device)
+                m.initialize_parameters()
+                torch.distributed.broadcast(
+                    m.lora_a.weight,
+                    src=0,
+                )
+                torch.distributed.broadcast(
+                    m.lora_b.weight,
+                    src=0,
+                )
+
         # For FSDP sharding
+        if self.parallel_dims.dp_replicate_enabled:
+            dp_mesh_dim_names = ("dp_replicate", "dp_shard")
+        else:
+            dp_mesh_dim_names = ("dp_shard",)
+
         fsdp_shard_conditions = [
             partial(
                 training.get_shard_conditions,
@@ -482,6 +536,7 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
             shard_conditions=fsdp_shard_conditions,
             cpu_offload=fsdp_cpu_offload,
             reshard_after_forward=reshard_after_forward,
+            dp_mesh=self.world_mesh[dp_mesh_dim_names],
         )
 
         if lora_weights_state_dict:
@@ -498,12 +553,6 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
         with training.set_default_dtype(self._dtype), self._device:
             lora_device = "cpu" if fsdp_cpu_offload else self._device
             for m in model.modules():
-                if (isinstance(m, AdapterModule)) and not lora_weights_state_dict:
-                    # lora may not be covered in state dict
-                    # if finetune for the 1st time
-                    m.to_empty(device=lora_device)
-                    m.initialize_parameters()
-
                 if hasattr(m, "rope_init"):
                     m.rope_init()
 
@@ -783,7 +832,7 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
                 # and increment the total number of tokens seen in the step
                 current_num_tokens = (
                     batch["labels"] != self._loss_fn.ignore_index
-                ).sum()
+                ).float().sum()
                 num_tokens += current_num_tokens
 
                 # Loss is normalized by default so we multiply by the number of tokens
@@ -794,13 +843,13 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
 
                 # Step with optimizer
                 if (idx + 1) % self._gradient_accumulation_steps == 0:
-                    # Get total number of tokens across all ranks to normalize gradients
-                    torch.distributed.all_reduce(num_tokens)
-                    # This will ensure that the logged loss matches what we're optimizing
-                    torch.distributed.all_reduce(running_loss)
+                    num_tokens = num_tokens.detach()
+                    running_loss = running_loss.detach()
+                    num_tokens = _dist_reduce(num_tokens, self.world_mesh["dp"])
+                    running_loss = _dist_reduce(running_loss, self.world_mesh["dp"])
                     # Manually scale the gradients from unnormalized loss by total # of tokens
                     # We multiply by world_size to undo FSDP2 gradient normalization.
-                    training.scale_grads(self._model, self.world_size / num_tokens)
+                    training.scale_grads(self._model, torch.tensor(self.world_size / num_tokens))
                     if self._clip_grad_norm is not None:
                         grad_norm = torch.nn.utils.clip_grad_norm_(
                             self._model.parameters(),
@@ -813,7 +862,7 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
                     # Update the number of steps when the weights are updated
                     self.global_step += 1
 
-                    loss_to_log = running_loss.detach().item() / num_tokens
+                    loss_to_log = running_loss / num_tokens
                     pbar.update(1)
                     pbar.set_description(
                         f"{curr_epoch + 1}|{self.global_step}|Loss: {loss_to_log}"
