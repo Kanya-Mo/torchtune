@@ -58,7 +58,8 @@ epochs: 1
 optimizer:
   _component_: torch.optim.AdamW
   lr: 2e-5
-  fused: True
+  fused: False
+  foreach: False
 loss:
   _component_: torchtune.modules.loss.LinearCrossEntropyLoss
 max_steps_per_epoch: null

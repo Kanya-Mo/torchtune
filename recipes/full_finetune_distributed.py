@@ -47,6 +47,13 @@ from torchtune.training.quantization import (
 )
 
 from tqdm import tqdm
+from torch.distributed.tensor import Replicate, Shard
+from torch.distributed.tensor.parallel import (
+    ColwiseParallel,
+    PrepareModuleInput,
+    RowwiseParallel,
+    SequenceParallel,
+)
 
 import torch.distributed._functional_collectives as funcol
 import torch.distributed.distributed_c10d as c10d
@@ -54,6 +61,72 @@ def _dist_reduce(x: torch.Tensor, mesh):
     if isinstance(x, DTensor):
         x = x.full_tensor()
     return funcol.all_reduce(x, reduceOp=c10d.ReduceOp.AVG.name, group=mesh).item()
+
+def apply_tp(
+    model: nn.Module,
+    tp_mesh
+):
+    """Apply tensor parallelism."""
+    # 1. Parallelize the embedding and shard its outputs (which are the first
+    # transformer block's inputs)
+    # 2. Parallelize the root norm layer over the sequence dim
+    # 3. Parallelize the final linear output layer
+    parallelize_module(
+        model,
+        tp_mesh,
+        {
+            "tok_embeddings": RowwiseParallel(
+                input_layouts=Replicate(),
+                output_layouts=Shard(1),
+            ),
+            "norm": SequenceParallel(),
+            "output": ColwiseParallel(
+                input_layouts=Shard(1),
+                output_layouts=Replicate(),
+                use_local_output=True,
+            ),
+        },
+    )
+
+    # Parallel styles used for transformer block linear weights and their
+    # inputs may be different for float8 linears with tensorwise scaling.
+    rowwise_parallel, colwise_parallel, prepare_module_input = (
+        RowwiseParallel,
+        ColwiseParallel,
+        PrepareModuleInput,
+    )
+
+    # Apply tensor + sequence parallelism to every transformer block
+    # NOTE: At the cost of model code change, we can accelerate Sequence Parallel
+    #       by folding (and unfolding) the batch dimension and the sequence dimension.
+    #       Examples can be found at https://github.com/pytorch/torchtitan/pull/437
+    for transformer_block in model.layers:
+        layer_plan = {
+            "attention_norm": SequenceParallel(),
+            "attention": prepare_module_input(
+                input_layouts=(Shard(1), None),
+                desired_input_layouts=(Replicate(), None),
+            ),
+            "attention.wq": colwise_parallel(),
+            "attention.wk": colwise_parallel(),
+            "attention.wv": colwise_parallel(),
+            "attention.wo": rowwise_parallel(output_layouts=Shard(1)),
+            "ffn_norm": SequenceParallel(),
+            "feed_forward": prepare_module_input(
+                input_layouts=(Shard(1),),
+                desired_input_layouts=(Replicate(),),
+            ),
+            "feed_forward.w1": colwise_parallel(),
+            "feed_forward.w2": rowwise_parallel(output_layouts=Shard(1)),
+            "feed_forward.w3": colwise_parallel(),
+        }
+
+        parallelize_module(
+            module=transformer_block,
+            device_mesh=tp_mesh,
+            parallelize_plan=layer_plan,
+        )
+
 
 class FullFinetuneRecipeDistributed(FTRecipeInterface):
     """
@@ -596,17 +669,18 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                     "Tensor parallelism is not supported with FSDP CPU offloading when data parallelism is disabled."
                 )
             # Use the local number (num_heads, num_kv_heads, embed_dim) to account for tensor parallel
-            model = training.prepare_mha_for_tp(model, self.world_mesh["tp"])
+            # model = training.prepare_mha_for_tp(model, self.world_mesh["tp"])
             if self.tp_plan is not None:
                 self.tp_plan = config.instantiate(
                     self.tp_plan,
                     model=model,
                 )
-            parallelize_module(
-                model,
-                self.world_mesh["tp"],
-                parallelize_plan=self.tp_plan,
-            )
+            # parallelize_module(
+            #     model,
+            #     self.world_mesh["tp"],
+            #     parallelize_plan=self.tp_plan,
+            # )
+            apply_tp(model, self.world_mesh["tp"])
 
         # We currently have two versions of activation checkpointing in this recipe
         # for testing and BC purposes. ``enable_activation_checkpointing`` controls
@@ -925,7 +999,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
                         # Manually scale the gradients from unnormalized loss by total # of tokens
                         self._grad_scaler(
-                            self._model.parameters(), torch.tensor(self.dp_degree / num_tokens)
+                            self._model.parameters(), torch.tensor(self.dp_degree / num_tokens), foreach=False
                         )
 
                         if self._clip_grad_norm is not None:
