@@ -999,7 +999,9 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
                         # Manually scale the gradients from unnormalized loss by total # of tokens
                         self._grad_scaler(
-                            self._model.parameters(), torch.tensor(self.dp_degree / num_tokens), foreach=False
+                        	self._model.parameters(),
+                        	torch.tensor(self.dp_degree / num_tokens),
+                        	foreach=False if self.parallel_dims.tp_enabled else None,
                         )
 
                         if self._clip_grad_norm is not None:
