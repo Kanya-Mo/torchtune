@@ -650,9 +650,10 @@ def shard_model(
     # Shard the model with FSDP, iterating in reverse to start with
     # lowest-level modules first
     num_layers_sharded = 0
-    for transformer_block in model.layers:
-        fully_shard(transformer_block, **fsdp_kwargs)
-        num_layers_sharded += 1
+    for n, m in reversed(list(model.named_modules())):
+        if any([shard_condition(n, m) for shard_condition in shard_conditions]):
+            fully_shard(m, **fsdp_kwargs)
+            num_layers_sharded += 1
 
     if num_layers_sharded == 0:
         raise ValueError(

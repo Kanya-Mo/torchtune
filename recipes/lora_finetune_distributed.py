@@ -3,7 +3,7 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
-
+import os
 import sys
 import time
 from datetime import timedelta
@@ -205,6 +205,10 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
         self.seed = training.set_seed(
             seed=cfg.seed, debug_mode=cfg.get("cudnn_deterministic_mode", None)
         )
+        os.environ["PYTHONHASHSEED"] = str(self.seed % 2 ** 32)
+        if self.world_mesh and self.world_mesh.get_coordinate() is not None:
+            torch.distributed.tensor._random.manual_seed(self.seed, self.world_mesh)
+
         self.epochs_run = 0
         self.total_epochs = cfg.epochs
         self.max_steps_per_epoch = cfg.max_steps_per_epoch
@@ -503,22 +507,6 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
                 model, auto_wrap_policy={modules.TransformerSelfAttentionLayer}
             )
 
-        lora_device = "cpu" if fsdp_cpu_offload else self._device
-        for m in model.modules():
-            if (isinstance(m, AdapterModule)) and not lora_weights_state_dict:
-                # lora may not be covered in state dict
-                # if finetune for the 1st time
-                m.to_empty(device=lora_device)
-                m.initialize_parameters()
-                torch.distributed.broadcast(
-                    m.lora_a.weight,
-                    src=0,
-                )
-                torch.distributed.broadcast(
-                    m.lora_b.weight,
-                    src=0,
-                )
-
         # For FSDP sharding
         if self.parallel_dims.dp_replicate_enabled:
             dp_mesh_dim_names = ("dp_replicate", "dp_shard")
@@ -563,6 +551,11 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
             cpu_offload=fsdp_cpu_offload,
         )
         for m in model.modules():
+            if (isinstance(m, AdapterModule)) and not lora_weights_state_dict:
+                # lora may not be covered in state dict
+                # if finetune for the 1st time
+                m.to_empty(device=lora_device)
+                m.initialize_parameters()
             if hasattr(m, "initialize_dora_magnitude"):
                 m.initialize_dora_magnitude()
 
