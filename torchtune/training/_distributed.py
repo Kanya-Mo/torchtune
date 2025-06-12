@@ -7,6 +7,7 @@
 
 import logging
 import os
+from copy import deepcopy
 from dataclasses import dataclass
 from functools import cached_property
 from itertools import chain
@@ -661,7 +662,11 @@ def shard_model(
         )
 
     # Finally shard the entire model to account for any stragglers
-    fully_shard(model, **fsdp_kwargs)
+    root_kwargs = deepcopy(fsdp_kwargs)
+    root_kwargs["reshard_after_forward"] = False
+    # TODO: we should actually use reshard_after_forward=None
+    # on latest nightlies: https://github.com/pytorch/pytorch/pull/155319
+    fully_shard(model, **root_kwargs)
 
 
 def prepare_mha_for_tp(
