@@ -499,6 +499,13 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
             reshard_after_forward=reshard_after_forward,
         )
 
+        mesh = None
+        for param in model.parameters():
+            mesh = param.device_mesh
+            break
+        if mesh and mesh.get_coordinate() is not None:
+            torch.distributed.tensor._random.manual_seed(self.seed, mesh)
+
         if lora_weights_state_dict:
             lora_missing, lora_unexpected = training.load_from_full_model_state_dict(
                 model,
