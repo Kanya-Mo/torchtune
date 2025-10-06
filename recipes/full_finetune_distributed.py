@@ -657,11 +657,18 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         # when these are set AND ``enable_activation_checkpointing`` is set to False
         # We'll clean this up as soon as testing of AC is complete
         if (not enable_activation_checkpointing) and (ac_mode is not None):
-            apply_selective_activation_checkpointing(
-                model,
-                ac_mode,
-                ac_option,
-            )
+            if hasattr(model, "layers"):
+                apply_selective_activation_checkpointing(
+                    model,
+                    ac_mode,
+                    ac_option,
+                )
+            else:
+                apply_selective_activation_checkpointing(
+                    model.decoder,
+                    ac_mode,
+                    ac_option,
+                )
 
         # original activation checkpointing (full) - flip the condition above
         if enable_activation_checkpointing and ac_mode is None:
