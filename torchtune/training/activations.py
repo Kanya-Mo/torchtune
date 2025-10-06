@@ -5,7 +5,8 @@
 # LICENSE file in the root directory of this source tree.
 
 from typing import Optional, Union
-
+from collections import defaultdict
+import torch
 from torch import nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper as ptd_checkpoint_wrapper,
@@ -62,6 +63,52 @@ def checkpoint_wrapper(module, ac_mode, ac_style):
         )
 
 
+def _apply_ac_to_transformer_block(
+    module: nn.Module,
+) -> nn.Module:
+    save_list = {torch.ops.aten.topk.default} # , torch.ops.aten.sigmoid.default
+
+    from torch.utils.checkpoint import (
+        CheckpointPolicy,
+        create_selective_checkpoint_contexts,
+    )
+
+    def _get_custom_policy(meta):
+        def _custom_policy(ctx, func, *args, **kwargs):
+            if (
+                func == torch.ops.aten._to_copy.default
+                and "cuda" in str(args[0].device)
+                and "device" in kwargs
+                and str(kwargs["device"]) == "cpu"
+            ):
+                return CheckpointPolicy.MUST_SAVE
+            mode = "recompute" if ctx.is_recompute else "forward"
+            mm_count_key = f"{mode}_mm_count"
+            if func == torch.ops.aten.mm.default:
+                meta[mm_count_key] += 1
+            # Saves output of all compute ops, except every second mm
+            to_save = func in save_list and not (
+                func == torch.ops.aten.mm.default and meta[mm_count_key] % 2 == 0
+            )
+            return (
+                CheckpointPolicy.MUST_SAVE
+                if to_save
+                else CheckpointPolicy.PREFER_RECOMPUTE
+            )
+
+        return _custom_policy
+
+    def selective_checkpointing_context_fn():
+        meta = defaultdict(int)
+        return create_selective_checkpoint_contexts(_get_custom_policy(meta))
+
+    return ptd_checkpoint_wrapper(
+        module,
+        context_fn=selective_checkpointing_context_fn,
+        preserve_rng_state=False,
+    )
+
+
 def apply_selective_activation_checkpointing(
     model: nn.Module,
     ac_mode: str,
@@ -79,10 +126,14 @@ def apply_selective_activation_checkpointing(
     """
 
     for layer_id, transformer_block in enumerate(model.layers):
-        if ac_mode in ("full", "selective"):
+        if ac_mode == "full":
             transformer_block = checkpoint_wrapper(
                 transformer_block,
                 ac_mode,
                 ac_option,
+            )
+        elif ac_mode == "selective":
+            transformer_block = _apply_ac_to_transformer_block(
+                transformer_block,
             )
         model.layers[layer_id] = transformer_block
