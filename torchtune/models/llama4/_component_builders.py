@@ -266,9 +266,9 @@ def llama4_decoder(
 
         mask_mod = None
         if skip_rope_interval is not None and (i + 1) % skip_rope_interval != 0:
-            mask_mod = partial(
-                get_chunked_attention_mask, chunk_size=attention_chunk_size
-            )
+            # mask_mod = partial(
+            #     get_chunked_attention_mask, chunk_size=attention_chunk_size
+            # )
             # Note: this is the value in llama-models, which doesn't match the config
             pos_embeddings = rope
 
@@ -652,9 +652,9 @@ def lora_llama4_decoder(
 
         mask_mod = None
         if skip_rope_interval is not None and (i + 1) % skip_rope_interval != 0:
-            mask_mod = partial(
-                get_chunked_attention_mask, chunk_size=attention_chunk_size
-            )
+            # mask_mod = partial(
+            #     get_chunked_attention_mask, chunk_size=attention_chunk_size
+            # )
             # Note: this is the value in llama-models, which doesn't match the config
             pos_embeddings = rope
 
